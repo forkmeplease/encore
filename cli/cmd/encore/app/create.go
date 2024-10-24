@@ -27,6 +27,7 @@ import (
 	"encr.dev/internal/version"
 	"encr.dev/pkg/github"
 	"encr.dev/pkg/xos"
+	daemonpb "encr.dev/proto/encore/daemon"
 )
 
 var (
@@ -85,6 +86,31 @@ func promptAccountCreation() {
 				continue PromptLoop
 			}
 			break
+		}
+	}
+}
+
+func promptRunApp() bool {
+	cyan := color.New(color.FgCyan)
+	red := color.New(color.FgRed)
+	for {
+		_, _ = cyan.Fprint(os.Stderr, "Run your app now? (Y/n): ")
+		var input string
+		_, _ = fmt.Scanln(&input)
+		input = strings.TrimSpace(input)
+		switch input {
+		case "Y", "y", "yes", "":
+			telemetry.Send("app.create.run", map[string]any{"response": true})
+			return true
+		case "N", "n", "no":
+			telemetry.Send("app.create.run", map[string]any{"response": false})
+			return false
+		case "q", "quit", "exit":
+			telemetry.Send("app.create.run", map[string]any{"response": false})
+			return false
+		default:
+			// Try again.
+			_, _ = red.Fprintln(os.Stderr, "Unexpected answer, please enter 'y' or 'n'.")
 		}
 	}
 }
@@ -164,30 +190,23 @@ func createApp(ctx context.Context, name, template string) (err error) {
 		}
 	}
 
-	// Create the app on the server.
 	_, err = conf.CurrentUser()
 	loggedIn := err == nil
 
+	exCfg, ok := parseExampleConfig(name)
+	if ok {
+		_ = os.Remove(exampleJSONPath(name))
+	}
 	var app *platform.App
 	if loggedIn && createAppOnPlatform {
 		s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
 		s.Prefix = "Creating app on encore.dev "
 		s.Start()
-
-		exCfg, ok := parseExampleConfig(name)
 		app, err = createAppOnServer(name, exCfg)
 		s.Stop()
 		if err != nil {
 			return fmt.Errorf("creating app on encore.dev: %v", err)
 		}
-
-		// Remove the example.json file if the app was successfully created.
-		if ok {
-			_ = os.Remove(exampleJSONPath(name))
-		}
-	} else {
-		// Remove the example config file since we're not creating the app on the platform.
-		_ = os.Remove(exampleJSONPath(name))
 	}
 
 	encoreAppPath := filepath.Join(name, "encore.app")
@@ -246,14 +265,52 @@ func createApp(ctx context.Context, name, template string) (err error) {
 	// it's a nice-to-have to avoid IDEs thinking there are compile errors before 'encore run' runs.
 	_ = generateWrappers(name)
 
-	_, _ = green.Printf("\nSuccessfully created app %s!\n", name)
-	cyanf := cyan.SprintfFunc()
-	if app != nil {
-		fmt.Printf("App ID:  %s\n", cyanf(app.Slug))
-		fmt.Printf("Web URL: %s%s", cyanf("https://app.encore.dev/"+app.Slug), cmdutil.Newline)
+	// Create the app on the daemon.
+	appRoot, err := filepath.Abs(name)
+	if err != nil {
+		cmdutil.Fatalf("failed to get absolute path: %v", err)
 	}
-
-	fmt.Print("\nUseful commands:\n\n")
+	daemon := cmdutil.ConnectDaemon(ctx)
+	_, err = daemon.CreateApp(ctx, &daemonpb.CreateAppRequest{
+		AppRoot:  appRoot,
+		Tutorial: exCfg.Tutorial,
+		Template: template,
+	})
+	if err != nil {
+		color.Red("Failed to create app on daemon: %s\n", err)
+	}
+	cmdutil.ClearTerminalExceptFirstNLines(0)
+	_, _ = green.Printf("Successfully created app %s!\n", name)
+	if app != nil {
+		cyanf := cyan.SprintfFunc()
+		fmt.Println()
+		fmt.Printf("App ID:   %s\n", cyanf(app.Slug))
+		fmt.Printf("Web URL:  %s%s", cyanf("https://app.encore.dev/"+app.Slug), cmdutil.Newline)
+		fmt.Printf("App Root: %s\n", cyanf(appRoot))
+		fmt.Println()
+	}
+	greenBoldF := green.Add(color.Bold).SprintfFunc()
+	fmt.Printf("Run your app with: %s\n", greenBoldF("cd %s && encore run", name))
+	fmt.Println()
+	if promptRunApp() {
+		cmdutil.ClearTerminalExceptFirstNLines(0)
+		stream, err := daemon.Run(ctx, &daemonpb.RunRequest{
+			AppRoot:    appRoot,
+			Watch:      true,
+			WorkingDir: ".",
+			Environ:    os.Environ(),
+			ListenAddr: "127.0.0.1:4000",
+			Browser:    daemonpb.RunRequest_BROWSER_ALWAYS,
+		})
+		if err != nil {
+			cmdutil.Fatalf("failed to run app: %v", err)
+		}
+		converter := cmdutil.ConvertJSONLogs(cmdutil.Colorize(true))
+		_ = cmdutil.StreamCommandOutput(stream, converter)
+		return nil
+	}
+	cmdutil.ClearTerminalExceptFirstNLines(0)
+	fmt.Print("Useful commands:\n\n")
 
 	_, _ = cyan.Printf("    encore run\n")
 	fmt.Print("        Run your app locally\n\n")
@@ -270,9 +327,7 @@ func createApp(ctx context.Context, name, template string) (err error) {
 		fmt.Print("        Deploys your app\n\n")
 	}
 
-	greenBoldF := green.Add(color.Bold).SprintfFunc()
 	fmt.Printf("Get started now: %s\n", greenBoldF("cd %s && encore run", name))
-
 	return nil
 }
 
@@ -522,6 +577,7 @@ func rewritePlaceholder(path string, info fs.DirEntry, app *platform.App) error 
 // exampleConfig is the optional configuration file for example apps.
 type exampleConfig struct {
 	InitialSecrets map[string]string `json:"initial_secrets"`
+	Tutorial       bool              `json:"tutorial"`
 }
 
 func parseExampleConfig(repoPath string) (cfg exampleConfig, exists bool) {
